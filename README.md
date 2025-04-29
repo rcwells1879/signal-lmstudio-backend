@@ -1,13 +1,15 @@
 # Signal LMStudio Backend
 
-This project provides a backend service that connects the Signal messaging app (via `signal-cli`) to a local Large Language Model (LLM) running through a server like LM Studio, which exposes an OpenAI-compatible API endpoint. It allows you to interact with the LLM by sending messages to your own number ("Note to Self") in the Signal app.
+Have you ever wanted a way to have your own free AI chatbot, runs entirely on your local machine, but that you can also access from your mobile device through an end-to-end encrypted link? This project provides a backend service that connects the Signal messaging app (via `signal-cli`) to a local Large Language Model (LLM) running through an LMStudio server, which exposes an OpenAI-compatible API endpoint. It allows you to interact with the LLM by sending messages to your own number ("Note to Self") in the Signal app. Be careful! depending on which local LLM you are running, the output can be completely UNCENSORED!
+
+**Image generation via Automatic1111 API coming soon!
 
 ## Features
 
 *   Connects to `signal-cli` running in daemon mode via TCP socket.
 *   Listens for incoming Signal messages, specifically messages sent to your own number ("Note to Self").
 *   Forwards messages from "Note to Self" to a specified LLM API endpoint.
-*   Maintains conversation history (context) for interactions with the LLM.
+*   Maintains current conversation history (context) for interactions with the LLM.
 *   Sends the LLM's response back to your "Note to Self" chat in Signal.
 *   Handles graceful shutdown on Ctrl+C.
 
@@ -23,8 +25,7 @@ signal-lmstudio-backend
 │   └── signal_handler.py # Manages signal-cli processes and message handling
 ├── tests
 │   ├── __init__.py      # Package for tests
-│   └── test_example.py   # Unit tests for the application
-
+│   └── test_example.py   # Unit tests for the applicatiom
 ├── requirements.txt      # Project dependencies
 └── README.md             # Project documentation
 ```
