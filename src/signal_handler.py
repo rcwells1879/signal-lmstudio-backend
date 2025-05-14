@@ -5,384 +5,513 @@ import time
 import socket
 import select # For non-blocking socket reads
 import queue # For thread-safe communication
-from .config import SIGNAL_CLI_PATH, YOUR_SIGNAL_NUMBER
-from .llm_client import LLMClient
+import os # Needed for image cleanup path check
+import signal as os_signal # Added to avoid conflict with signal module in main.py
 
-# --- Globals for JSON-RPC ---
-llm_client = None
+from .config import SIGNAL_CLI_PATH, YOUR_SIGNAL_NUMBER, SIGNAL_DAEMON_ADDRESS, JSON_RPC_PORT
+from .llm_client import LLMClient
+from .image_generator import generate_image
+
+# --- Globals ---
+llm_client_global = None # Renamed to avoid conflict with module-level llm_client
 signal_cli_process = None
 signal_socket = None
-listener_thread = None
-send_queue = queue.Queue() # Queue for messages to send
-receive_buffer = "" # Buffer for incoming socket data
-request_id_counter = 0 # Simple counter for JSON-RPC request IDs
-running = True # Flag to control loops
-JSON_RPC_PORT = 7583 # Default port for signal-cli jsonRpc, adjust if needed
+listener_thread_global = None # Renamed
+sender_thread_global = None  # Added
+signal_cli_stdout_thread = None # Added
+signal_cli_stderr_thread = None # Added
+
+send_queue = queue.Queue()
+receive_buffer = ""
+request_id_counter = 0
+running = True
 # --- End Globals ---
 
-def start_signal_cli_jsonrpc():
-    """Starts the signal-cli process in jsonRpc mode."""
-    global signal_cli_process, running
+def log_stream(stream, prefix, stop_event):
+    """Reads and prints lines from a stream until stop_event is set."""
+    try:
+        for line in iter(stream.readline, ''):
+            if stop_event.is_set() and not line: # Check stop event and if stream is truly empty
+                break
+            if line:
+                print(f"[{prefix}] {line.strip()}", flush=True)
+            elif stop_event.is_set(): # If stop_event is set and line is empty, break
+                break
+            else: # If line is empty but stop_event not set, stream might just be slow
+                time.sleep(0.01) # Small sleep to avoid busy-waiting on an empty line
+        stream.close()
+    except ValueError: # Handle "I/O operation on closed file"
+        print(f"[{prefix}] Stream closed.", flush=True)
+    except Exception as e:
+        print(f"[{prefix}] Error reading stream: {e}", flush=True)
+    finally:
+        print(f"[{prefix}] Logging thread finished.", flush=True)
+
+
+def start_signal_cli_daemon():
+    """Starts the signal-cli daemon process and threads to log its output."""
+    global signal_cli_process, signal_cli_stdout_thread, signal_cli_stderr_thread, running
+    
+    # Event to signal log_stream threads to stop
+    log_stop_event = threading.Event()
+
     command = [
         SIGNAL_CLI_PATH,
         "-u", YOUR_SIGNAL_NUMBER,
-        # Use the 'daemon' command, not 'jsonRpc' for socket/tcp mode
         "daemon",
-        # Use the --tcp flag with the host and port
-        "--tcp", f"127.0.0.1:{JSON_RPC_PORT}"
+        "--tcp", SIGNAL_DAEMON_ADDRESS # Use the full address from config
     ]
-    print(f"Starting signal-cli daemon for JSON-RPC on TCP for {YOUR_SIGNAL_NUMBER}...") # Updated print
-    print(f"Command: {' '.join(command)}")
+    print(f"Starting signal-cli daemon: {' '.join(command)}", flush=True)
     try:
+        creationflags = 0
+        if os.name == 'nt':
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
         signal_cli_process = subprocess.Popen(
             command,
-            stdin=subprocess.PIPE, # Keep stdin open
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, # Explicitly set stdin
             text=True,
             encoding='utf-8',
             errors='ignore',
-            bufsize=1
+            bufsize=1, # Line buffered
+            creationflags=creationflags
         )
-        # Give signal-cli a moment to start
-        time.sleep(3)
+        print(f"signal-cli daemon process started with PID: {signal_cli_process.pid}", flush=True)
+
+        # Start threads to log stdout and stderr from signal-cli
+        signal_cli_stdout_thread = threading.Thread(
+            target=log_stream,
+            args=(signal_cli_process.stdout, "signal-cli-out", log_stop_event),
+            daemon=True
+        )
+        signal_cli_stderr_thread = threading.Thread(
+            target=log_stream,
+            args=(signal_cli_process.stderr, "signal-cli-err", log_stop_event),
+            daemon=True
+        )
+        signal_cli_stdout_thread.start()
+        signal_cli_stderr_thread.start()
+
+        time.sleep(5) # Give signal-cli time to initialize
+
         if signal_cli_process.poll() is not None:
-             stderr_output = signal_cli_process.stderr.read()
-             print(f"signal-cli failed to start! Exit code: {signal_cli_process.poll()}")
-             print(f"Stderr:\n{stderr_output}")
-             running = False
-             return False
-        print("signal-cli process started.")
+            print(f"signal-cli failed to start or terminated prematurely. Return code: {signal_cli_process.returncode}", flush=True)
+            log_stop_event.set() # Signal logging threads to stop
+            return False
         return True
     except FileNotFoundError:
-        print(f"Error: signal-cli not found at '{SIGNAL_CLI_PATH}'. Cannot start JSON-RPC mode.")
+        print(f"Error: signal-cli executable not found at {SIGNAL_CLI_PATH}", flush=True)
         running = False
         return False
     except Exception as e:
-        print(f"An error occurred starting signal-cli: {e}")
+        print(f"Error starting signal-cli daemon: {e}", flush=True)
         running = False
         return False
 
-def connect_socket():
-    """Connects to the signal-cli JSON-RPC socket."""
+def connect_socket_to_daemon():
+    """Connects to the running signal-cli daemon."""
     global signal_socket, running
-    print(f"Attempting to connect to signal-cli socket at 127.0.0.1:{JSON_RPC_PORT}...")
+    host, port_str = SIGNAL_DAEMON_ADDRESS.split(':')
+    port = int(port_str)
+    print(f"Attempting to connect to signal-cli daemon at {host}:{port}...", flush=True)
     try:
-        signal_socket = socket.create_connection(("127.0.0.1", JSON_RPC_PORT), timeout=10)
-        signal_socket.setblocking(False) # Use non-blocking socket
-        print("Successfully connected to signal-cli socket.")
+        signal_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        signal_socket.connect((host, port))
+        signal_socket.setblocking(False) # Important for select
+        print("Successfully connected to signal-cli daemon.", flush=True)
         return True
     except socket.timeout:
-        print("Error: Connection to signal-cli socket timed out.")
-        running = False
-        return False
+        print(f"Error: Connection to signal-cli daemon at {SIGNAL_DAEMON_ADDRESS} timed out.", flush=True)
     except ConnectionRefusedError:
-        print("Error: Connection to signal-cli socket refused. Is signal-cli running in jsonRpc mode?")
-        running = False
-        return False
+        print(f"Error: Connection to signal-cli daemon at {SIGNAL_DAEMON_ADDRESS} refused.", flush=True)
     except Exception as e:
-        print(f"An error occurred connecting to socket: {e}")
-        running = False
-        return False
+        print(f"An error occurred connecting to signal-cli daemon: {e}", flush=True)
+    
+    running = False # If connection fails, stop
+    return False
 
+# process_incoming_message function remains largely the same
+# Ensure llm_client is used as llm_client_global if it's passed from main
 def process_incoming_message(data):
     """Processes a received message JSON from signal-cli."""
-    global llm_client
-    print(f"--- Entering process_incoming_message ---")
+    global llm_client_global # Use the renamed global
+    print(f"--- Entering process_incoming_message ---", flush=True)
     try:
         envelope = data.get('params', {}).get('envelope', {})
         if not envelope:
-            print("process_incoming_message: No envelope found.")
+            print("process_incoming_message: No envelope found.", flush=True)
             return
 
         sender_identifier = envelope.get('sourceUuid') or envelope.get('sourceNumber')
         sender_number = envelope.get('sourceNumber')
-        print(f"process_incoming_message: Sender identified as {sender_identifier}")
+        # It's crucial to use YOUR_SIGNAL_NUMBER from config here
+        # Ensure YOUR_SIGNAL_NUMBER is correctly loaded and accessible
+        
+        print(f"process_incoming_message: Sender identified as {sender_identifier}", flush=True)
 
         message_body = None
-        timestamp = None
-        recipient_for_reply = None # Determine who to reply to
+        # timestamp = None # timestamp variable was unused
+        recipient_for_reply = None 
 
-        # --- MODIFIED LOGIC ---
-        # Case 1: Regular incoming message from another contact
         if envelope.get('dataMessage'):
-            # Check if sender is self (e.g., message from another linked device NOT intended for bot)
-            # We generally want to ignore these unless explicitly handled below.
+            # Check if the message is from self by comparing source with YOUR_SIGNAL_NUMBER
+            # This logic might need adjustment if YOUR_SIGNAL_NUMBER is not directly comparable
+            # or if 'sourceName' being 'Note to Self' is a more reliable check.
             if sender_identifier == YOUR_SIGNAL_NUMBER or sender_number == YOUR_SIGNAL_NUMBER:
-                 print(f"process_incoming_message: Ignoring regular dataMessage from self ({sender_identifier})")
-                 return # Ignore regular messages from self
-
-            print("process_incoming_message: Found dataMessage (from external contact).")
+                 print(f"process_incoming_message: Ignoring regular dataMessage from self ({sender_identifier})", flush=True)
+                 return # Usually, we want to process messages to self if they are commands
+            print("process_incoming_message: Found dataMessage (from external contact).", flush=True)
             message_body = envelope['dataMessage'].get('message')
-            timestamp = envelope['dataMessage'].get('timestamp')
-            recipient_for_reply = sender_identifier # Reply to the sender
+            # timestamp = envelope['dataMessage'].get('timestamp') # Unused
+            recipient_for_reply = sender_identifier
 
-        # Case 2: Sync message (potentially a message sent *to* self)
         elif envelope.get('syncMessage'):
-            print("process_incoming_message: Found syncMessage.")
+            print("process_incoming_message: Found syncMessage.", flush=True)
             sync_message = envelope['syncMessage']
-            # Check if it's a "sent" message sync (message you sent from a device)
             if sync_message.get('sentMessage'):
                 sent_message = sync_message['sentMessage']
                 destination_uuid = sent_message.get('destinationUuid')
                 destination_number = sent_message.get('destinationNumber')
-                # IMPORTANT: Check if the message was sent TO your bot's number
+                # Check if the message was sent TO your number (i.e., it's a "Note to Self")
                 if destination_uuid == YOUR_SIGNAL_NUMBER or destination_number == YOUR_SIGNAL_NUMBER:
-                    print("process_incoming_message: Found sync'd 'sent' message addressed to self (potential bot command).")
+                    print("process_incoming_message: Found sync'd 'sent' message addressed to self (potential bot command).", flush=True)
                     message_body = sent_message.get('message')
-                    timestamp = sent_message.get('timestamp')
-                    # Reply to yourself USING THE UUID (sender_identifier)
-                    recipient_for_reply = sender_identifier # NEW - Use UUID for Note to Self replies
-                    print(f"process_incoming_message: Set recipient_for_reply to UUID: {recipient_for_reply}") # Optional: Add log
+                    # timestamp = sent_message.get('timestamp') # Unused
+                    # Reply to the original sender of the sync message, which is 'sourceUuid' or 'sourceNumber'
+                    # For "Note to Self", this will be your own UUID/number.
+                    recipient_for_reply = sender_identifier # This should be YOUR_SIGNAL_NUMBER's UUID
+                    print(f"process_incoming_message: Set recipient_for_reply to UUID: {recipient_for_reply}", flush=True)
                 else:
-                    print(f"process_incoming_message: Ignoring sync'd 'sent' message not addressed to self (sent to {destination_number or destination_uuid}).")
-                    return # Ignore messages you sent to others
+                    print(f"process_incoming_message: Ignoring sync'd 'sent' message not addressed to self (sent to {destination_number or destination_uuid}).", flush=True)
+                    return
+            elif sync_message.get('readMessages'):
+                print("process_incoming_message: Ignoring 'readMessages' sync message.", flush=True)
+                return
             else:
-                 print("process_incoming_message: Ignoring non-'sent' sync message.")
-                 return # Ignore other sync types (read receipts, etc.)
-
-        # Case 3: Typing indicator
+                 print(f"process_incoming_message: Ignoring other sync message type: {list(sync_message.keys())}", flush=True)
+                 return
+        # ... (rest of message type checks: typing, receipt, etc. - keep as is) ...
         elif envelope.get('typingMessage'):
-            print(f"process_incoming_message: Ignoring typing message from {sender_identifier}")
-            return # Ignore typing
-
-        # Case 4: Receipt message
+            print(f"process_incoming_message: Ignoring typing message from {sender_identifier}", flush=True)
+            return
         elif envelope.get('receiptMessage'):
-            print(f"process_incoming_message: Ignoring receipt message from {sender_identifier}")
-            return # Ignore receipts
-
-        # Case 5: Unhandled type
+            print(f"process_incoming_message: Ignoring receipt message from {sender_identifier}", flush=True)
+            return
         else:
-            print(f"process_incoming_message: Envelope type not handled: {list(envelope.keys())}")
-            return # Ignore other types
+            print(f"process_incoming_message: Envelope type not handled: {list(envelope.keys())}", flush=True)
+            return
 
-        # --- LLM Interaction (if message found and recipient determined) ---
         if message_body and recipient_for_reply:
-            print(f"Processing message: '{message_body}' from {sender_identifier or 'self'} at {timestamp}. Replying to: {recipient_for_reply}")
+            message_body_stripped = message_body.strip()
+            message_body_lower = message_body_stripped.lower()
 
-            if llm_client:
+            if message_body_lower == "/reset":
+                print(f"Resetting conversation for {sender_identifier}", flush=True)
+                if llm_client_global.reset_conversation(sender_identifier):
+                    system_prompt = "Keep your responses concise and to the point, ideally in 3-4 sentences unless more detail is specifically requested."
+                    llm_client_global.add_system_message(sender_identifier, system_prompt)
+                    send_signal_message(recipient_for_reply, "Conversation history reset.")
+                else:
+                    send_signal_message(recipient_for_reply, "Could not find conversation to reset.")
+                return
+
+            elif message_body_lower.startswith("xx"):
+                print("Keyword 'xx' detected. Initiating direct image generation flow (bypassing LLM).", flush=True)
+                direct_image_prompt = message_body_stripped[2:].strip()
+                if not direct_image_prompt:
+                    send_signal_message(recipient_for_reply, "Please provide a prompt after 'xx'. Example: xx a cute cat")
+                    return
                 try:
-                    print(f"Sending prompt to LLM: '{message_body}'")
-                    # Pass sender_identifier as user_id to maintain conversation context
-                    llm_response = llm_client.send_request(message_body, user_id=sender_identifier)
-                    print(f"Received LLM response: '{llm_response}'")
-                    # Queue the response to be sent
-                    send_signal_message(recipient_for_reply, llm_response)
+                    print(f"Calling image generator directly with prompt: '{direct_image_prompt}'", flush=True)
+                    image_path = generate_image(direct_image_prompt)
+                    if image_path:
+                        send_signal_message(recipient_for_reply, "", attachments=[image_path])
+                    else:
+                        send_signal_message(recipient_for_reply, "Sorry, direct image generation failed.")
                 except Exception as e:
-                    print(f"Error during LLM request or queuing Signal response: {e}")
-            else:
-                print("LLM client not initialized. Cannot process message.")
+                     print(f"Error during direct image generation or sending: {e}", flush=True)
+                     send_signal_message(recipient_for_reply, f"Sorry, an error occurred during direct image generation: {e}")
+                return
+
+            elif ";" in message_body_lower: # LLM-assisted image generation
+                print("Keyword ';' detected. Initiating LLM-assisted image generation flow.", flush=True)
+                if llm_client_global:
+                    try:
+                        image_prompt_instruction = f"Based on the following user request, generate a concise and effective prompt suitable for an AI image generator. Avoid full sentences. It should consist mainly of single words, and two word phrases separated by commas. (example: 1girl, Brunette, sweater, thong, green eyes, bent over, nervous, realistic, best quality,etc). Don't forget the commas. include hair color, eye color, and clothing in prompt. Only do this for image request prompts like this one. limit prompt length to 200 characters. User request: '{message_body}'"
+                        image_gen_prompt = llm_client_global.send_request(image_prompt_instruction, user_id=sender_identifier)
+                        print(f"Received image generation prompt from LLM: '{image_gen_prompt}'", flush=True)
+                        if not image_gen_prompt: raise Exception("LLM failed to generate an image prompt.")
+                        image_path = generate_image(image_gen_prompt)
+                        if image_path:
+                            send_signal_message(recipient_for_reply, "", attachments=[image_path])
+                        else:
+                            send_signal_message(recipient_for_reply, "Sorry, I couldn't generate the image.")
+                    except Exception as e:
+                        print(f"Error during LLM-assisted image generation: {e}", flush=True)
+                        send_signal_message(recipient_for_reply, f"Sorry, an error occurred: {e}")
+                return
+            else: # Regular text response
+                 if llm_client_global:
+                    try:
+                        print(f"No special keyword. Sending prompt to LLM for text response: '{message_body}'", flush=True)
+                        llm_response = llm_client_global.send_request(message_body, user_id=sender_identifier)
+                        print(f"Received LLM text response: '{llm_response}'", flush=True)
+                        send_signal_message(recipient_for_reply, llm_response)
+                    except Exception as e:
+                        print(f"Error during LLM request: {e}", flush=True)
+                        send_signal_message(recipient_for_reply, f"Sorry, an error occurred: {e}")
+                 return
+
         elif message_body is None:
-             print("process_incoming_message: No message body found to process.")
+             print("process_incoming_message: No message body found to process.", flush=True)
 
     except Exception as e:
-        print(f"Error processing incoming message JSON: {e}\nData: {data}")
+        print(f"Error processing incoming message JSON: {e}\nData: {data}", flush=True)
     finally:
-        print(f"--- Exiting process_incoming_message ---")
+        print(f"--- Exiting process_incoming_message ---", flush=True)
 
-def handle_socket_data():
+
+def handle_socket_data_loop():
     """Reads data from socket, parses JSON, and processes messages."""
-    global receive_buffer, running
-    print("--- handle_socket_data loop started ---")
+    global receive_buffer, running, signal_socket
+    print("--- handle_socket_data_loop started ---", flush=True)
     while running:
-        # print("--- Top of handle_socket_data loop ---") # Optional: Very verbose
-        ready_to_read = []
-        try:
-            # Check if socket is readable
-            # print("--- Checking socket readability (select)... ---") # Optional: Verbose
-            ready_to_read, _, _ = select.select([signal_socket], [], [], 0.1) # 0.1s timeout
-        except Exception as e:
-            print(f"Error during select: {e}")
+        if not signal_socket: # Check if socket is still valid
+            print("handle_socket_data_loop: Socket is None, exiting loop.", flush=True)
             running = False
             break
-
+        ready_to_read, _, _ = select.select([signal_socket], [], [], 0.1)
         if ready_to_read:
-            print("--- Socket is ready to read ---") # ADDED
             try:
-                data = signal_socket.recv(4096) # Read up to 4KB
-                if not data:
-                    print("Socket connection closed by signal-cli.")
-                    running = False
+                data = signal_socket.recv(4096)
+                if data:
+                    receive_buffer += data.decode('utf-8', errors='ignore')
+                    while '\n' in receive_buffer:
+                        message_json, receive_buffer = receive_buffer.split('\n', 1)
+                        if message_json:
+                            try:
+                                message_data = json.loads(message_json)
+                                if message_data.get('method') == 'receive':
+                                    process_incoming_message(message_data)
+                                # else: # Log other JSON-RPC responses/errors from signal-cli if needed
+                                # print(f"Received JSON-RPC from signal-cli: {message_data}", flush=True)
+                            except json.JSONDecodeError as jde:
+                                print(f"ERROR: JSONDecodeError: {jde}. Malformed JSON: {message_json}", flush=True)
+                            except Exception as e:
+                                print(f"ERROR: Exception processing JSON message: {e}\nJSON: {message_json}", flush=True)
+                else: # Socket closed
+                    print("Socket connection closed by signal-cli (recv returned 0 bytes).", flush=True)
+                    running = False # Signal all loops to stop
                     break
-                print(f"--- Received {len(data)} bytes from socket ---")
-                decoded_data = data.decode('utf-8', errors='ignore')
-                print(f"--- Decoded data chunk: {decoded_data[:200]}... ---") # ADDED
-                receive_buffer += decoded_data
-                print(f"--- Buffer size after adding: {len(receive_buffer)} ---") # ADDED
-
-                # Process complete JSON messages (newline-delimited)
-                print("--- Processing buffer for newline chars ---") # ADDED
-                while '\n' in receive_buffer:
-                    print(f"--- Found newline in buffer. Current buffer head: {receive_buffer[:100]}... ---") # ADDED
-                    message_json, receive_buffer = receive_buffer.split('\n', 1)
-                    print(f"--- Split message_json: {message_json[:100]}... | Remaining buffer head: {receive_buffer[:100]}... ---") # ADDED
-                    if message_json:
-                        print(f"--- Processing JSON line: {message_json[:200]}... ---")
-                        try:
-                            message_data = json.loads(message_json)
-                            if message_data.get('method') == 'receive':
-                                process_incoming_message(message_data)
-                            else:
-                                print(f"--- Received JSON is not a 'receive' method: {message_data.get('method')} (ID: {message_data.get('id')}) ---") # ADDED ID
-                        except json.JSONDecodeError:
-                            print(f"Error decoding JSON: {message_json}")
-                        except Exception as e:
-                            print(f"Error processing JSON message: {e}\nJSON: {message_json}")
-                    else:
-                        print("--- Split resulted in empty message_json (likely consecutive newlines) ---") # ADDED
-                print(f"--- Finished processing buffer for newlines. Remaining buffer size: {len(receive_buffer)} ---") # ADDED
-
-            except BlockingIOError:
-                print("--- BlockingIOError during recv (should not happen after select?) ---") # ADDED
-                pass
             except ConnectionResetError:
-                 print("Socket connection reset by signal-cli.")
-                 running = False
-                 break
-            except Exception as e:
-                print(f"Error reading from socket or processing buffer: {e}") # Changed error message scope
+                print("ERROR: ConnectionResetError during recv(). Socket connection reset by signal-cli.", flush=True)
                 running = False
                 break
-        # else: # Optional: Log when socket is not ready
-            # print("--- Socket not ready to read ---")
-
-        # Small sleep to prevent high CPU usage in loop if socket isn't readable often
+            except BlockingIOError: # Should not happen with select
+                pass
+            except Exception as e: # Catch other socket errors
+                if running: # Only print if we weren't already stopping
+                    print(f"ERROR: Unhandled exception during socket read: {e}", flush=True)
+                running = False
+                break
+        if not running: break # Check running flag again before sleep
         time.sleep(0.05)
-    print("--- handle_socket_data loop finished ---")
+    print("--- handle_socket_data_loop finished ---", flush=True)
 
-
-def handle_send_queue():
+def handle_send_queue_loop():
     """Sends messages from the queue over the socket."""
-    global request_id_counter, running
+    global request_id_counter, running, signal_socket, send_queue
+    print("--- handle_send_queue_loop started ---", flush=True)
     while running:
         try:
-            # Wait for a message in the queue (with timeout to allow checking 'running' flag)
-            recipient, message = send_queue.get(timeout=0.5)
+            recipient, message, attachments = send_queue.get(timeout=0.5) # Timeout to allow checking 'running' flag
+            if recipient is None: # Sentinel value to stop the thread
+                print("handle_send_queue_loop: Received stop sentinel.", flush=True)
+                break
+
+            if not signal_socket:
+                print("handle_send_queue_loop: Socket is None, cannot send. Discarding message.", flush=True)
+                send_queue.task_done()
+                continue
 
             request_id_counter += 1
-            request_json = {
-                "jsonrpc": "2.0",
-                "method": "send",
-                "params": {
-                    # Use 'recipient' for UUIDs, 'number' for phone numbers
-                    # Heuristic: Check if recipient looks like a phone number
-                    ("number" if recipient.startswith('+') else "recipient"): recipient,
-                    "message": message
-                    # Add other params like attachments if needed
-                },
-                "id": request_id_counter
-            }
+            params = {("number" if recipient.startswith('+') else "recipient"): recipient, "message": message}
+            if attachments:
+                params["attachments"] = [os.path.abspath(att) for att in attachments]
 
+            request_json = {"jsonrpc": "2.0", "method": "send", "params": params, "id": request_id_counter}
             try:
                 json_string = json.dumps(request_json) + '\n'
-                print(f"Sending JSON-RPC request ID {request_id_counter} to {recipient}: {message[:50]}...")
+                log_message = message[:50] + "..." if len(message) > 50 else message
+                log_message = log_message if message else "[Attachment Only]"
+                print(f"Sending JSON-RPC ID {request_id_counter} to {recipient}: '{log_message}'", flush=True)
                 signal_socket.sendall(json_string.encode('utf-8'))
-                # print(f"Sent JSON: {json_string.strip()}") # Debug print
-                send_queue.task_done() # Mark task as complete
             except BrokenPipeError:
-                 print("Error sending: Socket connection broken.")
-                 running = False # Stop loops
-                 break
+                print("Error sending: Socket connection broken (BrokenPipeError).", flush=True)
+                running = False # Stop all loops
+                # Re-queue the message? Or discard? For now, discard.
             except Exception as e:
-                print(f"Error sending JSON-RPC request: {e}")
-                # Optionally, re-queue the message or handle error
-
+                print(f"Error sending JSON-RPC ID {request_id_counter}: {e}", flush=True)
+            finally:
+                send_queue.task_done()
         except queue.Empty:
-            # Queue is empty, loop continues
-            continue
-        except Exception as e:
-            print(f"Error in send queue handler: {e}")
+            pass # Continue if queue is empty and timeout occurs
+        except Exception as e: # Catch other errors in the send loop
+            print(f"Error in send queue handler: {e}", flush=True)
+    print("--- handle_send_queue_loop finished ---", flush=True)
 
+def send_signal_message(recipient, message, attachments=None):
+    """Queues a message to be sent."""
+    send_queue.put((recipient, message, attachments if attachments is not None else []))
 
-def send_signal_message(recipient, message):
-    """Queues a message to be sent via JSON-RPC."""
-    if not isinstance(recipient, str):
-        print(f"Error: Recipient must be a string, got {type(recipient)}")
+def listener_main_loop():
+    """Main function for the listener thread."""
+    global running, llm_client_global, listener_thread_global, sender_thread_global
+    
+    if not start_signal_cli_daemon():
+        running = False # Ensure running is false if daemon fails
         return
-    send_queue.put((recipient, message))
+    if not connect_socket_to_daemon():
+        running = False # Ensure running is false if socket fails
+        # Attempt to clean up signal_cli if socket connection failed after start
+        if signal_cli_process and signal_cli_process.poll() is None:
+            print("Terminating signal-cli due to socket connection failure...", flush=True)
+            if os.name == 'nt':
+                subprocess.call(['taskkill', '/F', '/T', '/PID', str(signal_cli_process.pid)])
+            else:
+                signal_cli_process.terminate()
+        return
+
+    # Start the sender thread
+    sender_thread_global = threading.Thread(target=handle_send_queue_loop, daemon=True)
+    sender_thread_global.start()
+
+    # Handle socket data in the current thread
+    handle_socket_data_loop()
+
+    print("listener_main_loop finished.", flush=True)
 
 
-def json_rpc_listener_main():
-    """Main function to start signal-cli, connect socket, and handle I/O."""
-    global running
-    running = True # Reset running flag
+def start_listener_thread(llm_instance):
+    """Starts the main listener logic in a new thread."""
+    global llm_client_global, listener_thread_global, running
+    llm_client_global = llm_instance
+    running = True # Reset running flag at the start
 
-    if not start_signal_cli_jsonrpc():
-        return # Exit if signal-cli failed to start
+    if listener_thread_global and listener_thread_global.is_alive():
+        print("Listener thread already running.", flush=True)
+        return listener_thread_global
 
-    if not connect_socket():
-        # Attempt to clean up process if socket connection failed
-        if signal_cli_process:
-            signal_cli_process.terminate()
-        return # Exit if socket connection failed
-
-    # Start thread to handle sending messages from the queue
-    sender_thread = threading.Thread(target=handle_send_queue, daemon=True)
-    sender_thread.start()
-
-    # Start handling socket data in this thread
-    handle_socket_data()
-
-    # --- Cleanup ---
-    print("Listener loop stopped. Cleaning up...")
-    if signal_socket:
-        try:
-            signal_socket.close()
-            print("Socket closed.")
-        except Exception as e:
-            print(f"Error closing socket: {e}")
-    if signal_cli_process and signal_cli_process.poll() is None:
-        try:
-            signal_cli_process.terminate() # Ask nicely first
-            signal_cli_process.wait(timeout=5) # Wait a bit
-            print("signal-cli process terminated.")
-        except subprocess.TimeoutExpired:
-            print("signal-cli did not terminate gracefully, killing.")
-            signal_cli_process.kill() # Force kill
-        except Exception as e:
-            print(f"Error terminating signal-cli process: {e}")
-    print("JSON-RPC listener finished.")
-
-
-def start_listener_thread(llm_client_instance):
-    """Starts the JSON-RPC listener in a separate thread."""
-    global llm_client, listener_thread
-    llm_client = llm_client_instance
-
-    if listener_thread and listener_thread.is_alive():
-        print("Listener thread already running.")
-        return listener_thread
-
-    print("Initializing Signal JSON-RPC listener thread...")
-    listener_thread = threading.Thread(target=json_rpc_listener_main, daemon=True)
-    listener_thread.start()
-    print("Signal JSON-RPC listener thread started.")
-    return listener_thread
+    print("Initializing Signal listener thread...", flush=True)
+    listener_thread_global = threading.Thread(target=listener_main_loop, name="SignalListenerThread")
+    # Not setting daemon=True for listener_thread_global, so main can join it.
+    listener_thread_global.start()
+    print("Signal listener thread started.", flush=True)
+    return listener_thread_global
 
 def stop_listener():
-    """Stops the listener thread and cleans up."""
-    global running
-    print("Stopping listener...")
-    running = False # Signal loops to stop
-    # Wait for threads? The main listener thread should exit when socket closes or running is False.
-    # The sender thread is daemon, so it will exit when main thread exits.
-    # Cleanup happens in json_rpc_listener_main's finally block
+    """Stops all processes and threads gracefully."""
+    global running, signal_socket, signal_cli_process, listener_thread_global, sender_thread_global, signal_cli_stdout_thread, signal_cli_stderr_thread, send_queue
 
+    print("Initiating shutdown sequence...", flush=True)
+    running = False # Signal all loops to stop
 
+    # Signal sender_thread to stop
+    if sender_thread_global and sender_thread_global.is_alive():
+        print("Signaling sender thread to stop...", flush=True)
+        send_queue.put((None, None, None)) # Sentinel value
+
+    # Close socket
+    if signal_socket:
+        print("Closing signal socket...", flush=True)
+        try:
+            # signal_socket.shutdown(socket.SHUT_RDWR) # Can cause issues if already closed
+            signal_socket.close()
+        except OSError as e:
+            print(f"Error closing socket: {e}", flush=True)
+        finally:
+            signal_socket = None
+            print("Signal socket set to None.", flush=True)
+
+    # Wait for listener thread (which runs listener_main_loop)
+    if listener_thread_global and listener_thread_global.is_alive():
+        print("Waiting for listener thread to join...", flush=True)
+        listener_thread_global.join(timeout=10)
+        if listener_thread_global.is_alive():
+            print("Listener thread did not join in time.", flush=True)
+
+    # Wait for sender thread
+    if sender_thread_global and sender_thread_global.is_alive():
+        print("Waiting for sender thread to join...", flush=True)
+        sender_thread_global.join(timeout=5)
+        if sender_thread_global.is_alive():
+            print("Sender thread did not join in time.", flush=True)
+
+    # Terminate signal-cli process
+    if signal_cli_process and signal_cli_process.poll() is None:
+        print(f"Terminating signal-cli process (PID: {signal_cli_process.pid})...", flush=True)
+        log_stop_event = threading.Event() # Create a new one for this scope if needed
+                                          # Or ensure the one from start_signal_cli_daemon is accessible
+                                          # For simplicity, assume log_stream threads will see process.stdout/stderr close
+        
+        # Signal logging threads that the process is about to be terminated
+        # This is tricky because log_stop_event was local to start_signal_cli_daemon
+        # A better approach would be to pass a shared stop event or make it global.
+        # For now, rely on stream closure.
+
+        try:
+            if os.name == 'nt':
+                subprocess.call(['taskkill', '/F', '/T', '/PID', str(signal_cli_process.pid)])
+            else:
+                signal_cli_process.terminate()
+                try:
+                    signal_cli_process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    print("signal-cli did not terminate gracefully, killing...", flush=True)
+                    signal_cli_process.kill()
+                    signal_cli_process.wait(timeout=5) # Wait for kill
+            
+            if signal_cli_process.poll() is not None:
+                 print("signal-cli process terminated.", flush=True)
+            else:
+                 print("signal-cli process might still be running.", flush=True)
+
+        except Exception as e:
+            print(f"Error terminating signal-cli: {e}", flush=True)
+        finally:
+            signal_cli_process = None
+
+    # Wait for signal-cli output logging threads
+    if signal_cli_stdout_thread and signal_cli_stdout_thread.is_alive():
+        print("Waiting for signal-cli stdout logger thread to join...", flush=True)
+        signal_cli_stdout_thread.join(timeout=5)
+    if signal_cli_stderr_thread and signal_cli_stderr_thread.is_alive():
+        print("Waiting for signal-cli stderr logger thread to join...", flush=True)
+        signal_cli_stderr_thread.join(timeout=5)
+
+    print("Shutdown sequence complete.", flush=True)
+
+# If running signal_handler.py directly for testing (as per existing __main__ block)
+# This part needs to be updated to use the new function names and structure
 if __name__ == '__main__':
-    print("Running signal_handler.py directly for testing JSON-RPC mode...")
-    from .config import API_URL, MODEL_IDENTIFIER
-    from .llm_client import LLMClient
-
-    test_llm_client = LLMClient(API_URL, MODEL_IDENTIFIER)
-    start_listener_thread(test_llm_client)
-
+    print("Running signal_handler.py directly for testing JSON-RPC mode...", flush=True)
+    # This test setup is simplified and may need adjustment
+    # It assumes config.py is in the parent directory and loads .env
     try:
-        # Keep main thread alive, listener runs in background
-        while running and listener_thread.is_alive():
+        from .config import API_URL, MODEL_IDENTIFIER
+        test_llm_client = LLMClient(API_URL, MODEL_IDENTIFIER) # MODEL_IDENTIFIER is now auto-detected
+        start_listener_thread(test_llm_client)
+
+        while running: # Keep main test thread alive
+            if listener_thread_global and not listener_thread_global.is_alive():
+                print("Listener thread died unexpectedly.", flush=True)
+                running = False # Stop if listener thread dies
+                break
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nCtrl+C detected. Stopping...")
+        print("\nCtrl+C detected in test. Stopping...", flush=True)
     finally:
         stop_listener()
-        print("Test finished.")
+        print("Test finished.", flush=True)
