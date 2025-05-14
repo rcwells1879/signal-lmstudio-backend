@@ -1,12 +1,6 @@
 # Signal LMStudio Backend
 
-<<<<<<< HEAD
 This project provides a backend service that connects the Signal messaging app (via `signal-cli`) to a local Large Language Model (LLM) running through a server like LM Studio, which exposes an OpenAI-compatible API endpoint. It allows you to interact with the LLM by sending messages to your own number ("Note to Self") in the Signal app. It also supports generating images via a local Automatic1111 Stable Diffusion WebUI instance.
-=======
-Have you ever wanted a way to have your own free AI chatbot, runs entirely on your local machine, but that you can also access from your mobile device through an end-to-end encrypted link? This project provides a backend service that connects the Signal messaging app (via `signal-cli`) to a local Large Language Model (LLM) running through an LMStudio server, which exposes an OpenAI-compatible API endpoint. It allows you to interact with the LLM by sending messages to your own number ("Note to Self") in the Signal app. Be careful! depending on which local LLM you are running, the output can be completely UNCENSORED!
-
-**Image generation via Automatic1111 API coming soon!
->>>>>>> ad1f17e1352c6da3380c1a89c04735f759837ca0
 
 ## Features
 
