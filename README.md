@@ -1,13 +1,19 @@
 # Signal LMStudio Backend
 
+<<<<<<< HEAD
 This project provides a backend service that connects the Signal messaging app (via `signal-cli`) to a local Large Language Model (LLM) running through a server like LM Studio, which exposes an OpenAI-compatible API endpoint. It allows you to interact with the LLM by sending messages to your own number ("Note to Self") in the Signal app. It also supports generating images via a local Automatic1111 Stable Diffusion WebUI instance.
+=======
+Have you ever wanted a way to have your own free AI chatbot, runs entirely on your local machine, but that you can also access from your mobile device through an end-to-end encrypted link? This project provides a backend service that connects the Signal messaging app (via `signal-cli`) to a local Large Language Model (LLM) running through an LMStudio server, which exposes an OpenAI-compatible API endpoint. It allows you to interact with the LLM by sending messages to your own number ("Note to Self") in the Signal app. Be careful! depending on which local LLM you are running, the output can be completely UNCENSORED!
+
+**Image generation via Automatic1111 API coming soon!
+>>>>>>> ad1f17e1352c6da3380c1a89c04735f759837ca0
 
 ## Features
 
 *   Connects to `signal-cli` running in daemon mode via TCP socket.
 *   Listens for incoming Signal messages, specifically messages sent to your own number ("Note to Self").
 *   Forwards messages from "Note to Self" to a specified LLM API endpoint.
-*   Maintains conversation history (context) for interactions with the LLM.
+*   Maintains current conversation history (context) for interactions with the LLM.
 *   Sends the LLM's response back to your "Note to Self" chat in Signal.
 *   **Image Generation via Automatic1111 Stable Diffusion WebUI:**
     *   **LLM-Assisted Image Prompts:** Include a semicolon (`;`) in your message to have the LLM generate an image prompt based on the current conversation context. This prompt is then sent to Automatic1111.
@@ -27,8 +33,7 @@ signal-lmstudio-backend
 │   └── image_generator.py # Handles image generation via Automatic1111
 ├── tests
 │   ├── __init__.py      # Package for tests
-│   └── test_example.py   # Unit tests for the application
-
+│   └── test_example.py   # Unit tests for the applicatiom
 ├── requirements.txt      # Project dependencies
 └── README.md             # Project documentation
 ```
