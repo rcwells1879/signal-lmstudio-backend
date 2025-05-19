@@ -210,8 +210,6 @@ def process_incoming_message(data):
             if message_body_lower == "/reset":
                 print(f"Resetting conversation for {sender_identifier}", flush=True)
                 if llm_client_global.reset_conversation(sender_identifier):
-                    system_prompt = "Keep your responses concise and to the point, ideally in 3-4 sentences unless more detail is specifically requested."
-                    llm_client_global.add_system_message(sender_identifier, system_prompt)
                     send_signal_message(recipient_for_reply, "Conversation history reset.")
                 else:
                     send_signal_message(recipient_for_reply, "Could not find conversation to reset.")

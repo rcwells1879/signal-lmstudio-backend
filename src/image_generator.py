@@ -40,11 +40,11 @@ def generate_image(prompt: str) -> str | None:
     # --- Payload for Automatic1111 ---
     payload = {
         "prompt": full_prompt,
-        "steps": 20,
-        "sampler_index": "LCM",
+        "steps": 15,
+        "sampler_index": "Euler a",
         "cfg_scale": 1.25,
-        "width": 1152,
-        "height": 1408,
+        "width": 1280,
+        "height": 1280,
         "negative_prompt": "ugly, deformed, blurry, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, young, underage,",
         "n_iter": 1,
         "seed": -1
