@@ -30,7 +30,8 @@ signal-lmstudio-backend
 │   ├── __init__.py      # Package for tests
 │   └── test_example.py   # Unit tests for the application
 ├── requirements.txt      # Project dependencies
-└── README.md             # Project documentation
+├── README.md             # Project documentation
+└── .env                  # specify path to signal-cli, signal number and Forge API URL
 ```
 
 ## Prerequisites
