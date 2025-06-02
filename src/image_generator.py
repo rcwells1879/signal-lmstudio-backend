@@ -1,170 +1,242 @@
 import requests
 import base64
 import os
-import uuid
 import tempfile
-from .config import AUTOMATIC1111_API_URL # Assuming you add this to config.py
+import random
+import string
+import time
+import orjson
 
-# Ensure a temporary directory exists (optional, could use tempfile.mkstemp directly)
+from .config import (
+    FORGE_API_URL,
+    DEFAULT_NEGATIVE_PROMPT,
+    DEFAULT_IMAGE_WIDTH,
+    DEFAULT_IMAGE_HEIGHT,
+    DEFAULT_CFG_SCALE,
+    DEFAULT_SAMPLING_STEPS,
+    DEFAULT_SAMPLER_NAME,
+    DEFAULT_SCHEDULER,
+    DEFAULT_SEED,
+    DEFAULT_HIRES_FIX_ENABLED,
+    DEFAULT_HIRES_DENOISING_STRENGTH,
+    DEFAULT_HIRES_UPSCALER,
+    DEFAULT_HIRES_UPSCALE_BY,
+    DEFAULT_HIRES_STEPS
+)
+
 TEMP_IMAGE_DIR = os.path.join(os.path.dirname(__file__), '..', 'temp_images')
 os.makedirs(TEMP_IMAGE_DIR, exist_ok=True)
 
+def generate_random_string(length=15):
+    return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(length))
+
 def generate_image(prompt: str) -> str | None:
-    """
-    Generates an image using the Automatic1111 API based on the prompt.
-
-    Args:
-        prompt: The text prompt for image generation.
-
-    Returns:
-        The file path to the temporarily saved image, or None if generation failed.
-    """
-    if not AUTOMATIC1111_API_URL:
-        print("Error: AUTOMATIC1111_API_URL is not configured.")
+    if not FORGE_API_URL:
+        print("Error: FORGE_API_URL is not configured.")
         return None
 
-    api_endpoint = f"{AUTOMATIC1111_API_URL.rstrip('/')}/sdapi/v1/txt2img"
+    task_id_payload = f"task({generate_random_string()})"
+    session_hash_payload = generate_random_string()
 
-    # --- Construct the full prompt ---
-    quality_tags = "score_9, score_8_up, score_7_up, score_6_up, best quality,"
-    print(f"DEBUG image_generator: Original prompt received: '{prompt}'") # DEBUG
-    print(f"DEBUG image_generator: Quality tags defined: '{quality_tags}'") # DEBUG
+    # Register task with /internal/progress
+    internal_progress_endpoint = f"{FORGE_API_URL.rstrip('/')}/internal/progress"
+    progress_request_payload = {
+        "id_task": task_id_payload,
+        "id_live_preview": -1,
+        "live_preview": False
+    }
+    
+    try:
+        response_progress_init = requests.post(internal_progress_endpoint, json=progress_request_payload, timeout=10)
+        response_progress_init.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling initial /internal/progress: {e}")
+        return None
 
-    # Ensure there's a comma and space before adding tags
-    processed_prompt = prompt.strip().rstrip(',')
-    print(f"DEBUG image_generator: Processed prompt (stripped/rstripped): '{processed_prompt}'") # DEBUG
-    full_prompt = f"{quality_tags}, {processed_prompt}"
-    print(f"DEBUG image_generator: Constructed full_prompt: '{full_prompt}'") # DEBUG
-    # --- End prompt construction ---
+    # Construct prompt with quality tags
+    quality_tags = "best quality, dynamic lighting"
+    user_or_llm_prompt = prompt.strip()
+    current_prompt = f"{quality_tags.rstrip(', ')}, {user_or_llm_prompt.lstrip(', ')}" if user_or_llm_prompt else quality_tags
+    
+    # Payload array for Stable Diffusion Forge WebUI (fn_index: 256)
+    # Order and types must match exactly what the UI expects
+    data_payload_list = [
+        task_id_payload,
+        current_prompt,
+        DEFAULT_NEGATIVE_PROMPT,
+        [],
+        1,  # Batch count
+        1,  # Batch size
+        1.3,
+        3.5,
+        DEFAULT_IMAGE_WIDTH,
+        DEFAULT_IMAGE_HEIGHT,
+        DEFAULT_HIRES_FIX_ENABLED,
+        DEFAULT_HIRES_DENOISING_STRENGTH,
+        DEFAULT_HIRES_UPSCALE_BY,
+        DEFAULT_HIRES_UPSCALER,
+        DEFAULT_HIRES_STEPS,
+        0,  # Hires target width
+        0,  # Hires target height
+        "Use same checkpoint",
+        ["Use same choices"],
+        "Use same sampler",
+        "Use same scheduler",
+        "",  # Script name
+        "",  # Script arguments
+        DEFAULT_CFG_SCALE,
+        3.5,
+        None,
+        "None",  # Sampler override
+        DEFAULT_SAMPLING_STEPS,
+        DEFAULT_SAMPLER_NAME,
+        DEFAULT_SCHEDULER,
+        False,  # Restore faces
+        "",     # Tiling
+        0.8,    # Denoising strength
+        DEFAULT_SEED,
+        False,  # Variation seed enabled
+        -1,     # Variation seed
+        0,      # Variation seed strength
+        0,      # Resize seed from H/W
+        0,      # Sigma churn
+        
+        # ControlNet parameters
+        None, None, None, False, 7, 1, "Constant", 0, "Constant", 0, 1,
+        
+        # ADetailer parameters
+        "enable", "MEAN", "AD", 1, False, 1.01, 1.02, 0.99, 0.95, 0, 1, False,
+        0.5, 2, 1, False, 3, 0, 0, 1, False, 3, 2, 0, 0.35, True, "bicubic", "bicubic",
+        False, 0, "anisotropic", 0, "reinhard", 100, 0, "subtract", 0, 0, "gaussian",
+        "add", 0, 100, 127, 0, "hard_clamp", 5, 0, "None", "None",
+        
+        # Additional parameters
+        False, "MultiDiffusion", 768, 768, 64, 4, False, 1, False, False, False, False,
+        "positive", "comma", 0, False, False, "start", "", False,
+        "Seed", "", "", "Nothing", "", "", "Nothing", "", "",
+        True, False, False, False, False, False, False, 0, False
+    ]
 
-    # --- Payload for Automatic1111 ---
-    payload = {
-        "prompt": full_prompt,
-        "steps": 15,
-        "sampler_index": "Euler a",
-        "cfg_scale": 1.25,
-        "width": 1280,
-        "height": 1280,
-        "negative_prompt": "ugly, deformed, blurry, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, young, underage,",
-        "n_iter": 1,
-        "seed": -1
-    } # Correct closing brace
-    # --- End Payload ---
-
-    # --- Log the FINAL prompt being sent ---
-    # Log directly from the payload dictionary to be certain
-    print(f"Sending image generation request to {api_endpoint} with payload prompt: '{payload.get('prompt', 'PROMPT KEY MISSING')}'", flush=True)
-
-    # --- ADD FULL PAYLOAD LOGGING ---
-    print(f"DEBUG: Full payload being sent: {payload}", flush=True)
-    # --- END ADD ---
+    # Submit job to queue
+    queue_join_endpoint = f"{FORGE_API_URL.rstrip('/')}/queue/join"
+    queue_join_payload = {
+        "data": data_payload_list,
+        "event_data": None,
+        "fn_index": 256,
+        "trigger_id": 16,
+        "session_hash": session_hash_payload
+    }
 
     try:
-        # Send the POST request to the Automatic1111 API
-        # Increase timeout as image generation can take time
-        response = requests.post(api_endpoint, json=payload, timeout=180) # Further increased timeout
-        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+        response_join = requests.post(queue_join_endpoint, json=queue_join_payload, timeout=30)
+        response_join.raise_for_status()
+        
+        # Connect to SSE stream for results
+        queue_data_endpoint = f"{FORGE_API_URL.rstrip('/')}/queue/data"
+        queue_data_params = {"session_hash": session_hash_payload}
+        
+        time.sleep(1)
+        image_path_from_sse = None
 
-        r = response.json()
+        try:
+            response_sse = requests.get(queue_data_endpoint, params=queue_data_params, timeout=180, stream=True)
+            response_sse.raise_for_status()
 
-        # Check if the response contains image data
-        if 'images' not in r or not r['images']:
-            print("Error: No images found in Automatic1111 response.")
-            print(f"Response JSON: {r}") # Log the response for debugging
-            return None
+            for line in response_sse.iter_lines(decode_unicode=True):
+                if not line or not line.startswith('data: '):
+                    continue
+                    
+                event_data_str = line[len('data: '):]
+                try:
+                    event_data = orjson.loads(event_data_str)
+                    msg_type = event_data.get("msg")
 
-        # Decode the base64 image data (assuming the first image is the one we want)
-        image_data_base64 = r['images'][0]
-        image_data_bytes = base64.b64decode(image_data_base64)
+                    if msg_type == "process_completed":
+                        output_data = event_data.get("output", {}).get("data")
+                        if output_data and isinstance(output_data, list) and output_data:
+                            image_results_container = output_data[0]
+                            if isinstance(image_results_container, list) and image_results_container:
+                                first_image_data_item = image_results_container[0]
 
-        # Save the image to a temporary file using tempfile for better management
-        # Suffix ensures signal-cli recognizes it as an image (e.g., .png)
-        # delete=False is important so the file isn't deleted when the handle is closed
-        # We will delete it manually after sending using cleanup_image
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=TEMP_IMAGE_DIR)
-        temp_file_path = temp_file.name # Get the path before closing
-        temp_file.write(image_data_bytes)
-        temp_file.close() # Close the file handle
+                                image_url_to_download = None
+                                if isinstance(first_image_data_item, dict):
+                                    image_dict = first_image_data_item.get('image')
+                                    if image_dict and isinstance(image_dict, dict):
+                                        image_url_to_download = image_dict.get('url')
 
-        print(f"Image saved temporarily to: {temp_file_path}")
-        return temp_file_path # Return the path to the saved file
+                                # Handle direct base64 fallback
+                                elif isinstance(first_image_data_item, str) and first_image_data_item.startswith('data:image/png;base64,'):
+                                    img_b64_str = first_image_data_item.split(',', 1)[1]
+                                    try:
+                                        image_data_bytes = base64.b64decode(img_b64_str)
+                                        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=TEMP_IMAGE_DIR)
+                                        temp_file.write(image_data_bytes)
+                                        temp_file.close()
+                                        response_sse.close()
+                                        image_path_from_sse = temp_file.name
+                                        break
+                                    except Exception as e:
+                                        print(f"Error decoding base64: {e}")
 
-    except requests.exceptions.Timeout:
-        print(f"Error: Timeout connecting to Automatic1111 API at {api_endpoint}")
-        return None
+                                # Download image from URL
+                                if image_url_to_download and isinstance(image_url_to_download, str) and image_url_to_download.startswith('http'):
+                                    try:
+                                        if image_url_to_download.startswith('/file='):
+                                            absolute_image_url = f"{FORGE_API_URL.rstrip('/')}{image_url_to_download}"
+                                        else:
+                                            absolute_image_url = image_url_to_download
+
+                                        image_response = requests.get(absolute_image_url, timeout=30)
+                                        image_response.raise_for_status()
+                                        
+                                        image_data_bytes = image_response.content
+                                        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=TEMP_IMAGE_DIR)
+                                        temp_file.write(image_data_bytes)
+                                        temp_file.close()
+                                        response_sse.close()
+                                        image_path_from_sse = temp_file.name
+                                        break
+                                    except Exception as e:
+                                        print(f"Error downloading image: {e}")
+
+                        if image_path_from_sse:
+                            break
+                            
+                except Exception as e:
+                    print(f"Error parsing SSE event: {e}")
+                    continue
+
+            if image_path_from_sse:
+                return image_path_from_sse
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error during SSE connection: {e}")
+
     except requests.exceptions.RequestException as e:
-        print(f"Error connecting to Automatic1111 API: {e}")
-        return None
-    except KeyError as e:
-        print(f"Error: Unexpected response format from Automatic1111 API. Missing key: {e}")
-        # Check if response object exists before trying to access .text
-        if 'response' in locals() and response is not None:
-             print(f"Response JSON: {response.text}") # Log raw response text
+        print(f"Error during API call: {e}")
         return None
     except Exception as e:
-        print(f"An unexpected error occurred during image generation or saving: {e}")
+        print(f"Unexpected error: {e}")
         return None
+    
+    print("Image generation failed")
+    return None
 
 def cleanup_image(file_path: str):
     """Deletes the temporary image file."""
     if file_path and os.path.exists(file_path):
         try:
             os.remove(file_path)
-            print(f"Cleaned up temporary image: {file_path}")
         except Exception as e:
-            print(f"Error cleaning up temporary image {file_path}: {e}")
-    else:
-        # Don't print error if file_path is None or empty
-        if file_path:
-            print(f"Skipping cleanup, file not found: {file_path}")
+            print(f"Error cleaning up image {file_path}: {e}")
 
-# --- Test Execution Block ---
 if __name__ == '__main__':
-    print("--- Running image_generator.py directly for testing ---")
-
-    # --- Make sure config is loaded when run directly ---
-    # This assumes config.py handles loading .env correctly
-    # If not, you might need to explicitly load .env here too
-    try:
-        # Attempt to load config to ensure AUTOMATIC1111_API_URL is set
-        from . import config
-        print(f"AUTOMATIC1111_API_URL from config: {config.AUTOMATIC1111_API_URL}")
-    except ImportError:
-        print("Could not import config, ensure .env is loaded if needed.")
-        # Optionally, load .env directly here for standalone testing
-        # from dotenv import load_dotenv
-        # load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / '.env')
-        # AUTOMATIC1111_API_URL = os.getenv("AUTOMATIC1111_API_URL")
-        # print(f"AUTOMATIC1111_API_URL from direct load: {AUTOMATIC1111_API_URL}")
-    # --- End config load attempt ---
-
-
-    test_prompt = "a cute cat wearing a wizard hat, digital art"
-    print(f"Test Prompt: '{test_prompt}'")
-
-    image_path = None # Initialize image_path
-    try:
+    if not FORGE_API_URL:
+        print("FORGE_API_URL not configured")
+    else:
+        test_prompt = "a beautiful landscape"
         image_path = generate_image(test_prompt)
-
         if image_path:
-            print(f"SUCCESS: Image generated and saved to: {image_path}")
-            # Optional: You can manually open the image path here to verify
-            # import webbrowser
-            # webbrowser.open(image_path)
+            print(f"Image generated: {image_path}")
         else:
-            print("FAILURE: Image generation failed.")
-
-    except Exception as e:
-        print(f"An error occurred during the test: {e}")
-
-    finally:
-        # --- IMPORTANT: Clean up the generated image ---
-        """if image_path:
-            print("Attempting cleanup...")
-            # Give a small delay in case the file system needs a moment
-            import time
-            time.sleep(1)
-            cleanup_image(image_path)"""
-        # --- End cleanup ---
-
-    print("--- Test finished ---")
+            print("Image generation failed")

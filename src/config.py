@@ -20,7 +20,24 @@ else:
 # Configuration settings
 API_URL = os.getenv("API_URL", "http://127.0.0.1:1234")
 MODEL_IDENTIFIER = os.getenv("MODEL_IDENTIFIER", "cydonia-24b-v2.1")
-AUTOMATIC1111_API_URL = os.getenv("AUTOMATIC1111_API_URL", "http://127.0.0.1:7860")
+FORGE_API_URL = os.getenv("FORGE_API_URL", "http://127.0.0.1:7860") # New
+
+# --- Image Generation Settings ---
+DEFAULT_NEGATIVE_PROMPT = os.getenv("DEFAULT_NEGATIVE_PROMPT", "")
+DEFAULT_IMAGE_WIDTH = int(os.getenv("DEFAULT_IMAGE_WIDTH", "1440"))
+DEFAULT_IMAGE_HEIGHT = int(os.getenv("DEFAULT_IMAGE_HEIGHT", "1280"))
+DEFAULT_CFG_SCALE = float(os.getenv("DEFAULT_CFG_SCALE", "1.4"))
+DEFAULT_SAMPLING_STEPS = int(os.getenv("DEFAULT_SAMPLING_STEPS", "20"))
+DEFAULT_SAMPLER_NAME = os.getenv("DEFAULT_SAMPLER_NAME", "Euler a")
+DEFAULT_SCHEDULER = os.getenv("DEFAULT_SCHEDULER", "LCM")
+DEFAULT_SEED = int(os.getenv("DEFAULT_SEED", "-1")) # -1 for random
+
+# Hires Fix Settings (example, based on your payload)
+DEFAULT_HIRES_FIX_ENABLED = os.getenv("DEFAULT_HIRES_FIX_ENABLED", "False").lower() == 'true'
+DEFAULT_HIRES_DENOISING_STRENGTH = float(os.getenv("DEFAULT_HIRES_DENOISING_STRENGTH", "0.7"))
+DEFAULT_HIRES_UPSCALER = os.getenv("DEFAULT_HIRES_UPSCALER", "Latent")
+DEFAULT_HIRES_UPSCALE_BY = float(os.getenv("DEFAULT_HIRES_UPSCALE_BY", "2.0")) # Assuming index 12 (value 2) is upscale factor
+DEFAULT_HIRES_STEPS = int(os.getenv("DEFAULT_HIRES_STEPS", "0")) # Assuming index 14 (value 0) is hires steps
 
 # Add other configurations as needed
 SIGNAL_CLI_PATH = os.getenv("SIGNAL_CLI_PATH", "signal-cli")

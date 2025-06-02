@@ -1,2 +1,3 @@
 # filepath: .gitignore
 temp_images/
+.env

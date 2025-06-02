@@ -20,7 +20,7 @@ if __name__ == '__main__':
 
     # Initialize the LLM Client
     try:
-        llm_client = LLMClient(API_URL, MODEL_IDENTIFIER)
+        llm_client = LLMClient(API_URL) # Corrected: Removed MODEL_IDENTIFIER
     except Exception as e:
         print(f"Failed to initialize LLM Client: {e}")
         exit(1) # Exit if LLM client fails
